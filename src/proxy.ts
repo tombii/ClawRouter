@@ -785,6 +785,16 @@ export type InsufficientFundsInfo = {
 export type ProxyOptions = {
   walletKey: string;
   apiBase?: string;
+  /**
+   * When set, forward requests to this LiteLLM (or any OpenAI-compatible) base URL
+   * instead of BlockRun. Bypasses x402 payment flow entirely.
+   * Example: "http://localhost:4000"
+   */
+  litellmBaseUrl?: string;
+  /**
+   * API key sent as "Authorization: Bearer <key>" when litellmBaseUrl is set.
+   */
+  litellmApiKey?: string;
   /** Port to listen on (default: 8402) */
   port?: number;
   routingConfig?: Partial<RoutingConfig>;
@@ -923,7 +933,7 @@ function estimateAmount(
  * Returns a handle with the assigned port, base URL, and a close function.
  */
 export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
-  const apiBase = options.apiBase ?? BLOCKRUN_API;
+  const apiBase = options.litellmBaseUrl ?? options.apiBase ?? BLOCKRUN_API;
 
   // Determine port: options.port > env var > default
   const listenPort = options.port ?? getProxyPort();
@@ -932,14 +942,18 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   const existingWallet = await checkExistingProxy(listenPort);
   if (existingWallet) {
     // Proxy already running — reuse it instead of failing with EADDRINUSE
-    const account = privateKeyToAccount(options.walletKey as `0x${string}`);
-    const balanceMonitor = new BalanceMonitor(account.address);
     const baseUrl = `http://127.0.0.1:${listenPort}`;
+    const reuseAddress = options.litellmBaseUrl
+      ? "litellm"
+      : privateKeyToAccount(options.walletKey as `0x${string}`).address;
+    const reuseMonitor = new BalanceMonitor(
+      options.litellmBaseUrl ? "0x0000000000000000000000000000000000000000" : reuseAddress,
+    );
 
     // Verify the existing proxy is using the same wallet (or warn if different)
-    if (existingWallet !== account.address) {
+    if (!options.litellmBaseUrl && existingWallet !== reuseAddress) {
       console.warn(
-        `[ClawRouter] Existing proxy on port ${listenPort} uses wallet ${existingWallet}, but current config uses ${account.address}. Reusing existing proxy.`,
+        `[ClawRouter] Existing proxy on port ${listenPort} uses wallet ${existingWallet}, but current config uses ${reuseAddress}. Reusing existing proxy.`,
       );
     }
 
@@ -949,19 +963,36 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
       port: listenPort,
       baseUrl,
       walletAddress: existingWallet,
-      balanceMonitor,
+      balanceMonitor: reuseMonitor,
       close: async () => {
         // No-op: we didn't start this proxy, so we shouldn't close it
       },
     };
   }
 
-  // Create x402 payment-enabled fetch from wallet private key
-  const account = privateKeyToAccount(options.walletKey as `0x${string}`);
-  const { fetch: payFetch } = createPaymentFetch(options.walletKey as `0x${string}`);
+  // LiteLLM mode: use plain bearer-auth fetch, skip x402/wallet entirely
+  const isLiteLLM = !!options.litellmBaseUrl;
+  let account: ReturnType<typeof privateKeyToAccount> | undefined;
+  let payFetch: (input: RequestInfo | URL, init?: RequestInit, preAuth?: PreAuthParams) => Promise<Response>;
+  let balanceMonitor: BalanceMonitor;
 
-  // Create balance monitor for pre-request checks
-  const balanceMonitor = new BalanceMonitor(account.address);
+  if (isLiteLLM) {
+    const apiKey = options.litellmApiKey ?? "";
+    payFetch = (input, init) =>
+      fetch(input, {
+        ...init,
+        headers: {
+          ...(init?.headers as Record<string, string> | undefined),
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
+      });
+    // Dummy balance monitor that always reports sufficient funds
+    balanceMonitor = new BalanceMonitor("0x0000000000000000000000000000000000000000");
+  } else {
+    account = privateKeyToAccount(options.walletKey as `0x${string}`);
+    payFetch = createPaymentFetch(options.walletKey as `0x${string}`).fetch;
+    balanceMonitor = new BalanceMonitor(account.address);
+  }
 
   // Build router options (100% local — no external API calls for routing)
   const routingConfig = mergeRoutingConfig(options.routingConfig);
@@ -1021,7 +1052,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
 
       const response: Record<string, unknown> = {
         status: "ok",
-        wallet: account.address,
+        wallet: account?.address ?? "litellm",
       };
 
       if (full) {
@@ -1266,7 +1297,7 @@ export async function startProxy(options: ProxyOptions): Promise<ProxyHandle> {
   return {
     port,
     baseUrl,
-    walletAddress: account.address,
+    walletAddress: account?.address ?? "litellm",
     balanceMonitor,
     close: () =>
       new Promise<void>((res, rej) => {
@@ -1755,7 +1786,7 @@ async function proxyRequest(
   let estimatedCostMicros: bigint | undefined;
   const isFreeModel = modelId === FREE_MODEL;
 
-  if (modelId && !options.skipBalanceCheck && !isFreeModel) {
+  if (modelId && !options.skipBalanceCheck && !isFreeModel && !options.litellmBaseUrl) {
     const estimated = estimateAmount(modelId, body.length, maxTokens);
     if (estimated) {
       estimatedCostMicros = BigInt(estimated);

@@ -13,10 +13,13 @@
  *   pm2 start "npx @blockrun/clawrouter" --name clawrouter
  */
 
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { startProxy, getProxyPort } from "./proxy.js";
 import { resolveOrGenerateWalletKey } from "./auth.js";
 import { BalanceMonitor } from "./balance.js";
 import { VERSION } from "./version.js";
+import type { RoutingConfig } from "./router/index.js";
 
 function printHelp(): void {
   console.log(`
@@ -26,13 +29,29 @@ Usage:
   clawrouter [options]
 
 Options:
-  --version, -v     Show version number
-  --help, -h        Show this help message
-  --port <number>   Port to listen on (default: ${getProxyPort()})
+  --version, -v        Show version number
+  --help, -h           Show this help message
+  --port <number>      Port to listen on (default: ${getProxyPort()})
+  --config <path>      Path to JSON config file (default: clawrouter.json)
+
+Config file (clawrouter.json):
+  {
+    "litellmBaseUrl": "http://localhost:4000",
+    "litellmApiKey": "sk-...",
+    "tiers": {
+      "SIMPLE":    { "primary": "my-model/fast",   "fallback": ["my-model/backup"] },
+      "MEDIUM":    { "primary": "my-model/medium",  "fallback": ["my-model/fast"] },
+      "COMPLEX":   { "primary": "my-model/large",   "fallback": ["my-model/medium"] },
+      "REASONING": { "primary": "my-model/reason",  "fallback": ["my-model/large"] }
+    },
+    "classifier": {
+      "llmModel": "my-model/fast"
+    }
+  }
 
 Examples:
-  # Start standalone proxy (survives gateway restarts)
-  npx @blockrun/clawrouter
+  # Start with LiteLLM backend
+  npx @blockrun/clawrouter --config clawrouter.json
 
   # Start on custom port
   npx @blockrun/clawrouter --port 9000
@@ -43,13 +62,56 @@ Examples:
 Environment Variables:
   BLOCKRUN_WALLET_KEY     Private key for x402 payments (auto-generated if not set)
   BLOCKRUN_PROXY_PORT     Default proxy port (default: 8402)
+  LITELLM_BASE_URL        LiteLLM base URL (overrides config file)
+  LITELLM_API_KEY         LiteLLM API key (overrides config file)
 
 For more info: https://github.com/BlockRunAI/ClawRouter
 `);
 }
 
-function parseArgs(args: string[]): { version: boolean; help: boolean; port?: number } {
-  const result = { version: false, help: false, port: undefined as number | undefined };
+type ClawRouterConfig = {
+  litellmBaseUrl?: string;
+  litellmApiKey?: string;
+  routing?: Partial<RoutingConfig>;
+  // Top-level tier shortcuts (merged into routing.tiers etc.)
+  tiers?: Partial<RoutingConfig["tiers"]>;
+  ecoTiers?: Partial<RoutingConfig["tiers"]>;
+  premiumTiers?: Partial<RoutingConfig["tiers"]>;
+  agenticTiers?: Partial<RoutingConfig["tiers"]>;
+  classifier?: Partial<RoutingConfig["classifier"]>;
+  overrides?: Partial<RoutingConfig["overrides"]>;
+};
+
+function loadConfig(configPath: string): ClawRouterConfig {
+  const absPath = resolve(configPath);
+  if (!existsSync(absPath)) {
+    return {};
+  }
+  try {
+    const raw = readFileSync(absPath, "utf-8");
+    const parsed = JSON.parse(raw) as ClawRouterConfig;
+    console.log(`[ClawRouter] Loaded config from ${absPath}`);
+    return parsed;
+  } catch (err) {
+    console.error(`[ClawRouter] Failed to parse config file ${absPath}: ${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+}
+
+function buildRoutingConfig(cfg: ClawRouterConfig): Partial<RoutingConfig> {
+  // Allow top-level tiers/classifier/overrides as shortcuts, merged under routing
+  const routing: Partial<RoutingConfig> = { ...cfg.routing };
+  if (cfg.tiers) routing.tiers = { ...routing.tiers, ...cfg.tiers } as RoutingConfig["tiers"];
+  if (cfg.ecoTiers) routing.ecoTiers = { ...routing.ecoTiers, ...cfg.ecoTiers } as RoutingConfig["tiers"];
+  if (cfg.premiumTiers) routing.premiumTiers = { ...routing.premiumTiers, ...cfg.premiumTiers } as RoutingConfig["tiers"];
+  if (cfg.agenticTiers) routing.agenticTiers = { ...routing.agenticTiers, ...cfg.agenticTiers } as RoutingConfig["tiers"];
+  if (cfg.classifier) routing.classifier = { ...routing.classifier, ...cfg.classifier } as RoutingConfig["classifier"];
+  if (cfg.overrides) routing.overrides = { ...routing.overrides, ...cfg.overrides } as RoutingConfig["overrides"];
+  return routing;
+}
+
+function parseArgs(args: string[]): { version: boolean; help: boolean; port?: number; config: string } {
+  const result = { version: false, help: false, port: undefined as number | undefined, config: "clawrouter.json" };
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -59,7 +121,10 @@ function parseArgs(args: string[]): { version: boolean; help: boolean; port?: nu
       result.help = true;
     } else if (arg === "--port" && args[i + 1]) {
       result.port = parseInt(args[i + 1], 10);
-      i++; // Skip next arg
+      i++;
+    } else if (arg === "--config" && args[i + 1]) {
+      result.config = args[i + 1];
+      i++;
     }
   }
 
@@ -79,21 +144,38 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Resolve wallet key
+  // Load config file
+  const cfg = loadConfig(args.config);
+  const routingConfig = buildRoutingConfig(cfg);
+
+  // LiteLLM: env vars override config file
+  const litellmBaseUrl = process.env.LITELLM_BASE_URL ?? cfg.litellmBaseUrl;
+  const litellmApiKey = process.env.LITELLM_API_KEY ?? cfg.litellmApiKey;
+
+  if (litellmBaseUrl) {
+    console.log(`[ClawRouter] LiteLLM mode: ${litellmBaseUrl}`);
+  }
+
+  // Resolve wallet key (still needed for non-LiteLLM mode)
   const { key: walletKey, address, source } = await resolveOrGenerateWalletKey();
 
-  if (source === "generated") {
-    console.log(`[ClawRouter] Generated new wallet: ${address}`);
-  } else if (source === "saved") {
-    console.log(`[ClawRouter] Using saved wallet: ${address}`);
-  } else {
-    console.log(`[ClawRouter] Using wallet from BLOCKRUN_WALLET_KEY: ${address}`);
+  if (!litellmBaseUrl) {
+    if (source === "generated") {
+      console.log(`[ClawRouter] Generated new wallet: ${address}`);
+    } else if (source === "saved") {
+      console.log(`[ClawRouter] Using saved wallet: ${address}`);
+    } else {
+      console.log(`[ClawRouter] Using wallet from BLOCKRUN_WALLET_KEY: ${address}`);
+    }
   }
 
   // Start the proxy
   const proxy = await startProxy({
     walletKey,
     port: args.port,
+    litellmBaseUrl,
+    litellmApiKey,
+    routingConfig: Object.keys(routingConfig).length > 0 ? routingConfig : undefined,
     onReady: (port) => {
       console.log(`[ClawRouter] Proxy listening on http://127.0.0.1:${port}`);
       console.log(`[ClawRouter] Health check: http://127.0.0.1:${port}/health`);
@@ -116,20 +198,22 @@ async function main(): Promise<void> {
     },
   });
 
-  // Check balance
-  const monitor = new BalanceMonitor(address);
-  try {
-    const balance = await monitor.checkBalance();
-    if (balance.isEmpty) {
-      console.log(`[ClawRouter] Wallet balance: $0.00 (using FREE model)`);
-      console.log(`[ClawRouter] Fund wallet for premium models: ${address}`);
-    } else if (balance.isLow) {
-      console.log(`[ClawRouter] Wallet balance: ${balance.balanceUSD} (low)`);
-    } else {
-      console.log(`[ClawRouter] Wallet balance: ${balance.balanceUSD}`);
+  // Check balance (skip in LiteLLM mode)
+  if (!litellmBaseUrl) {
+    const monitor = new BalanceMonitor(address);
+    try {
+      const balance = await monitor.checkBalance();
+      if (balance.isEmpty) {
+        console.log(`[ClawRouter] Wallet balance: $0.00 (using FREE model)`);
+        console.log(`[ClawRouter] Fund wallet for premium models: ${address}`);
+      } else if (balance.isLow) {
+        console.log(`[ClawRouter] Wallet balance: ${balance.balanceUSD} (low)`);
+      } else {
+        console.log(`[ClawRouter] Wallet balance: ${balance.balanceUSD}`);
+      }
+    } catch {
+      console.log(`[ClawRouter] Wallet: ${address} (balance check pending)`);
     }
-  } catch {
-    console.log(`[ClawRouter] Wallet: ${address} (balance check pending)`);
   }
 
   console.log(`[ClawRouter] Ready - Ctrl+C to stop`);
