@@ -894,6 +894,9 @@ function mergeRoutingConfig(overrides?: Partial<RoutingConfig>): RoutingConfig {
     classifier: { ...DEFAULT_ROUTING_CONFIG.classifier, ...overrides.classifier },
     scoring: { ...DEFAULT_ROUTING_CONFIG.scoring, ...overrides.scoring },
     tiers: { ...DEFAULT_ROUTING_CONFIG.tiers, ...overrides.tiers },
+    ecoTiers: { ...DEFAULT_ROUTING_CONFIG.ecoTiers, ...overrides.ecoTiers } as RoutingConfig["ecoTiers"],
+    premiumTiers: { ...DEFAULT_ROUTING_CONFIG.premiumTiers, ...overrides.premiumTiers } as RoutingConfig["premiumTiers"],
+    agenticTiers: { ...DEFAULT_ROUTING_CONFIG.agenticTiers, ...overrides.agenticTiers } as RoutingConfig["agenticTiers"],
     overrides: { ...DEFAULT_ROUTING_CONFIG.overrides, ...overrides.overrides },
   };
 }

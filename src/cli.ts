@@ -102,9 +102,15 @@ function buildRoutingConfig(cfg: ClawRouterConfig): Partial<RoutingConfig> {
   // Allow top-level tiers/classifier/overrides as shortcuts, merged under routing
   const routing: Partial<RoutingConfig> = { ...cfg.routing };
   if (cfg.tiers) routing.tiers = { ...routing.tiers, ...cfg.tiers } as RoutingConfig["tiers"];
-  if (cfg.ecoTiers) routing.ecoTiers = { ...routing.ecoTiers, ...cfg.ecoTiers } as RoutingConfig["tiers"];
-  if (cfg.premiumTiers) routing.premiumTiers = { ...routing.premiumTiers, ...cfg.premiumTiers } as RoutingConfig["tiers"];
-  if (cfg.agenticTiers) routing.agenticTiers = { ...routing.agenticTiers, ...cfg.agenticTiers } as RoutingConfig["tiers"];
+  // For profile-specific tiers not explicitly set, fall back to the user's base tiers
+  // so agentic/eco/premium requests don't silently use built-in model names.
+  const baseTiers = routing.tiers;
+  if (cfg.ecoTiers) routing.ecoTiers = { ...baseTiers, ...routing.ecoTiers, ...cfg.ecoTiers } as RoutingConfig["tiers"];
+  else if (baseTiers) routing.ecoTiers = baseTiers;
+  if (cfg.premiumTiers) routing.premiumTiers = { ...baseTiers, ...routing.premiumTiers, ...cfg.premiumTiers } as RoutingConfig["tiers"];
+  else if (baseTiers) routing.premiumTiers = baseTiers;
+  if (cfg.agenticTiers) routing.agenticTiers = { ...baseTiers, ...routing.agenticTiers, ...cfg.agenticTiers } as RoutingConfig["tiers"];
+  else if (baseTiers) routing.agenticTiers = baseTiers;
   if (cfg.classifier) routing.classifier = { ...routing.classifier, ...cfg.classifier } as RoutingConfig["classifier"];
   if (cfg.overrides) routing.overrides = { ...routing.overrides, ...cfg.overrides } as RoutingConfig["overrides"];
   return routing;
